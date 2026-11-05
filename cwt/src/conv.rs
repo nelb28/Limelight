@@ -192,6 +192,32 @@ mod tests {
             .map(|c| c.norm())
             .fold(0.0f64, |a, b| a.max(b));
         
-        assert!(max_magnitude > 0.1);
+        // With the dt factor, a unit sine at the matched frequency gives roughly
+        // sqrt(scale) * 0.94 ≈ 0.09 here (previously 1000x larger at 1 kHz sampling).
+        assert!(max_magnitude > 0.05 && max_magnitude < 0.2, "got {}", max_magnitude);
+    }
+
+    #[test]
+    fn test_magnitude_independent_of_sample_rate() {
+        let morlet = Morlet::standard();
+        let freq = 100.0;
+        let scale = morlet.freq_to_scale(freq);
+        let peak_at = |rate: f64| {
+            let dt = 1.0 / rate;
+            let kernel = wavelet_kernel(&morlet, scale, dt, 8.0);
+            let n = (rate * 2.0) as usize; // 2 seconds
+            let signal: Vec<f64> = (0..n)
+                .map(|i| (2.0 * PI * freq * i as f64 * dt).sin())
+                .collect();
+            let result = convolve(&signal, &kernel);
+            // Measure in the middle, away from edge effects.
+            result[n / 2 - 50..n / 2 + 50]
+                .iter()
+                .map(|c| c.norm())
+                .fold(0.0f64, f64::max)
+        };
+        let a = peak_at(8000.0);
+        let b = peak_at(44100.0);
+        assert!((a - b).abs() / b < 0.02, "magnitudes differ: {} vs {}", a, b);
     }
 }

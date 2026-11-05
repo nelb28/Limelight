@@ -31,7 +31,9 @@ pub fn wavelet_kernel<W: Wavelet>(wavelet: &W, scale: f64, dt: f64, ts: f64) -> 
         // Evaluate scaled wavelet: ψ(t/a) / sqrt(a)
         let t_normalized = t / scale;
         let psi = wavelet.eval(t_normalized);
-        let normalization = 1.0 / scale.sqrt();
+        // The dt factor turns the discrete convolution sum into an integral approximation,
+        // making output magnitudes independent of the sample rate.
+        let normalization = dt / scale.sqrt();
         
         let kernel_val = Complex64::new(
             psi.re * normalization,

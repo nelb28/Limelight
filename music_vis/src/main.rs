@@ -13,7 +13,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
-        eprintln!("Usage: music_vis <audio.flac> <audio.cwt>");
+        eprintln!("Usage: music_vis <audio.flac|mp3|wav|ogg> <audio.cwt>");
         std::process::exit(1);
     }
     let audio_path = PathBuf::from(&args[1]);

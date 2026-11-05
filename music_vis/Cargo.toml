@@ -9,5 +9,5 @@ winit = "0.30.12"
 pollster = "0.4"
 env_logger = "0.11.8"
 log = "0.4.29"
-rodio = { version = "0.22.1", features = ["symphonia-flac"] }
+rodio = { version = "0.22.1", features = ["symphonia-flac", "symphonia-mp3", "symphonia-wav", "symphonia-vorbis"] }
 bytemuck = { version = "1", features = ["derive"] }

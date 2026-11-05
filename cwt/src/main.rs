@@ -19,25 +19,50 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 || args.len() > 3 {
-        eprintln!("Usage: cwt <input.pcm> [output.cwt]");
+    // Parse optional `--sample-rate <hz>` flag; remaining args are positional.
+    let mut positional: Vec<String> = Vec::new();
+    let mut rate_flag: Option<u32> = None;
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--sample-rate" || a == "-r" {
+            let v = it.next().and_then(|v| v.parse::<u32>().ok());
+            if v.is_none() {
+                eprintln!("--sample-rate requires an integer value in Hz");
+                std::process::exit(1);
+            }
+            rate_flag = v;
+        } else {
+            positional.push(a.clone());
+        }
+    }
+    if positional.is_empty() || positional.len() > 2 {
+        eprintln!("Usage: cwt <input.pcm> [output.cwt] [--sample-rate <hz>]");
+        eprintln!("  Sample rate defaults to the <input>.sr sidecar file, else 96000.");
         std::process::exit(1);
     }
-    let input_path = PathBuf::from(&args[1]);
-    let output_path = if args.len() == 3 {
-        PathBuf::from(&args[2])
+    let input_path = PathBuf::from(&positional[0]);
+    let output_path = if positional.len() == 2 {
+        PathBuf::from(&positional[1])
     } else {
         input_path.with_extension("cwt")
     };
 
-    let sample_rate: u32 = 96000;
+    let sample_rate: u32 = rate_flag
+        .or_else(|| {
+            std::fs::read_to_string(input_path.with_extension("sr"))
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+        })
+        .unwrap_or(96000);
+    println!("Sample rate: {} Hz", sample_rate);
     let dt = 1.0 / sample_rate as f64;
     let ts = 8.0;
     let frame_rate: u32 = 60;
-    let hop_size = sample_rate as usize / frame_rate as usize; // 1600
-    let window_size = hop_size * 2; // 3200 (50% overlap)
+    let hop_size = (sample_rate as f64 / frame_rate as f64).round() as usize; 
+    let window_size = hop_size * 2; // 50% overlap
     let min_freq = 19.45;
-    let max_freq = 9550.0;
+    // Keep the top analysis frequency safely below Nyquist for low-rate (e.g. MP3) audio.
+    let max_freq = f64::min(9550.0, sample_rate as f64 * 0.45);
     let voices_per_octave = 48;
 
     let morlet = Morlet::new(6.0);
