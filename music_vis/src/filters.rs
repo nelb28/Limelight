@@ -431,17 +431,17 @@ const HARMONIC_TOLERANCE_CENTS: f32 = 35.0;
 const MIN_ROOT_RATIO: f32 = 0.1;
 
 #[derive(Debug, Clone)]
-struct Peak {
+pub(crate) struct Peak {
     /// Fractional bin position (parabolic interpolation on log amplitude).
-    pos: f32,
-    amp: f32,
+    pub pos: f32,
+    pub amp: f32,
     /// Inclusive bin range scaled when the peak gives or receives amplitude.
     lo: usize,
     hi: usize,
 }
 
 /// Prominent spectral peaks of one frame, sorted by frequency, with non-overlapping regions.
-fn find_peaks(row: &[f32]) -> Vec<Peak> {
+pub(crate) fn find_peaks(row: &[f32], max_peaks: usize) -> Vec<Peak> {
     let ns = row.len();
     let frame_max = row.iter().cloned().fold(0.0, f32::max);
     if ns < 3 || frame_max <= EPS {
@@ -486,7 +486,7 @@ fn find_peaks(row: &[f32]) -> Vec<Peak> {
 
     // Keep the strongest, then restore frequency order.
     peaks.sort_by(|a, b| row[b.0].total_cmp(&row[a.0]));
-    peaks.truncate(MAX_PEAKS);
+    peaks.truncate(max_peaks);
     peaks.sort_by_key(|p| p.0);
 
     let mut out: Vec<Peak> = Vec::with_capacity(peaks.len());
@@ -535,7 +535,7 @@ fn find_peaks(row: &[f32]) -> Vec<Peak> {
 /// receive amplitude, so there are no chains (an octave of an octave counts as k = 4).
 fn fold_gains(row: &[f32], bins_per_octave: f32, amount: f32, count: usize) -> Vec<f32> {
     let mut gain = vec![1.0f32; row.len()];
-    let peaks = find_peaks(row);
+    let peaks = find_peaks(row, MAX_PEAKS);
     let cents_per_bin = 1200.0 / bins_per_octave;
     let mut roots: Vec<usize> = Vec::new();
     let mut received = vec![0.0f32; peaks.len()];
@@ -562,28 +562,57 @@ fn fold_gains(row: &[f32], bins_per_octave: f32, amount: f32, count: usize) -> V
         }
         match best {
             Some((r, _)) => {
-                received[r] += amount * pj.amp;
-                // Uniform: scaling a region bounded by dips down cannot create new peaks
-                // (a height-tapered cut would leave a crater with two new shoulders).
-                for g in &mut gain[pj.lo..=pj.hi] {
-                    *g = 1.0 - amount;
+                // Lower the peak toward the straight line between its region's edge dips:
+                // new = line + (1 - amount) * (row - line). The result is a blend of the
+                // original curve and a straight line, so it keeps the curve's shape (no
+                // crater, no new peaks) and meets the neighbours exactly at the edges
+                // (no step, as a uniform cut of the whole region would leave).
+                let (ex, top) = excess(row, pj);
+                received[r] += amount * top;
+                for (s, e) in (pj.lo..=pj.hi).zip(ex) {
+                    if row[s] > EPS {
+                        gain[s] = 1.0 - amount * e / row[s];
+                    }
                 }
             }
             None => roots.push(j),
         }
     }
-    for (r, add) in received.iter().enumerate() {
-        if *add > 0.0 {
-            let p = &peaks[r];
-            // Tapered by height so the boost fades out toward the region's dips: a uniform
-            // boost would put a step at the edges that shows up as new peaks.
-            let boost = add / p.amp;
-            for s in p.lo..=p.hi {
-                gain[s] = 1.0 + boost * (row[s] / p.amp).min(1.0);
+    for (r, &add) in received.iter().enumerate() {
+        if add <= 0.0 {
+            continue;
+        }
+        let p = &peaks[r];
+        // Add the received amplitude on top of the root's own peak, shaped like the part
+        // above its edge line, so the boost is zero at the edges and `add` at the top.
+        let (ex, top) = excess(row, p);
+        for (s, e) in (p.lo..=p.hi).zip(ex) {
+            if row[s] > EPS {
+                let shape = if top > 0.01 * p.amp {
+                    e / top
+                } else {
+                    // Flat-topped region (peak on a region edge): fall back to tapering by height.
+                    (row[s] / p.amp).min(1.0)
+                };
+                gain[s] = 1.0 + add * shape / row[s];
             }
         }
     }
     gain
+}
+
+/// Part of a peak's region that rises above the straight line between the region's edge
+/// values, per bin from `lo` to `hi`, and that excess at the peak's top bin.
+/// An edge at the peak itself (peak on the spectrum edge) uses the other edge's level.
+fn excess(row: &[f32], p: &Peak) -> (Vec<f32>, f32) {
+    let top_bin = (p.pos.round() as usize).clamp(p.lo, p.hi);
+    let left = if p.lo < top_bin { row[p.lo] } else { row[p.hi] };
+    let right = if p.hi > top_bin { row[p.hi] } else { row[p.lo] };
+    let span = (p.hi - p.lo).max(1) as f32;
+    let line = |s: usize| left + (right - left) * (s - p.lo) as f32 / span;
+    let ex: Vec<f32> = (p.lo..=p.hi).map(|s| (row[s] - line(s)).max(0.0)).collect();
+    let top = ex[top_bin - p.lo];
+    (ex, top)
 }
 
 /// Magnitude-weighted rolling mean and mean-of-squares of `dev` along time.
@@ -821,6 +850,28 @@ mod tests {
     }
 
     #[test]
+    fn fundamental_leaves_no_steps_at_shallow_dips() {
+        // Root at 40, its octave at 88, and an unrelated tone at 98 whose lobe merges
+        // with the octave's (shallow dip between them), plus one beside the root at 50.
+        let g = grid(1, 217);
+        let mut x = vec![0.001f32; 217];
+        add_lobe(&mut x, 40.0, 1.0, 4.0);
+        add_lobe(&mut x, 50.0, 0.8, 4.0);
+        add_lobe(&mut x, 88.0, 0.9, 4.0);
+        add_lobe(&mut x, 98.0, 0.8, 4.0);
+        let max_step = |r: &[f32]| r.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+        let orig = x.clone();
+        run(&g, &Filter::Fundamental { amount: 1.0, count: 6, secs: 0.0 }, &mut x);
+        assert!(x[88] < 0.75 * orig[88], "octave not reduced: {}", x[88]);
+        assert!(x[40] > 1.3, "root not boosted: {}", x[40]);
+        // Relative to the tallest peak (as the bars show it), neighbouring bins differ no
+        // more than in the input: a cut or boost edge would show as a much bigger jump.
+        let peak = |r: &[f32]| r.iter().cloned().fold(0.0, f32::max);
+        let (before, after) = (max_step(&orig) / peak(&orig), max_step(&x) / peak(&x));
+        assert!(after < 1.2 * before, "step {after} vs input {before}");
+    }
+
+    #[test]
     fn fundamental_ignores_unrelated_peaks_and_is_scale_invariant() {
         let g = grid(1, 217);
         // Ratio 1.4 (a tritone-ish 583 cents): not harmonic, must be untouched.
@@ -974,6 +1025,63 @@ mod diagnostics {
             let (rough, peaks) = metrics(&cwt);
             let name = if chain.trim().is_empty() { "(raw)" } else { chain.trim() };
             println!("METRIC {name:40} roughness={rough:.3} peaks/frame={peaks:.1} last-filter-changed={:.1}%", changed * 100.0);
+        }
+    }
+
+    /// Sharp edges as drawn, after each prefix of a chain:
+    /// `CWT_PATH=... CHAIN="tilt contrast" PCT=99.7 cargo test --release edges -- --ignored --nocapture`.
+    /// freq-edges: neighbouring bins whose bar heights differ by > 10% of the bar area
+    /// (near-vertical walls in the bar graph), per frame.
+    /// time-edges: % of frames where most visible bins jump by > 6 dB at once
+    /// (vertical lines in the spectrogram).
+    #[test]
+    #[ignore]
+    fn edges() {
+        let path = std::env::var("CWT_PATH").expect("set CWT_PATH");
+        let chain = std::env::var("CHAIN").expect("set CHAIN");
+        let pct: f32 = std::env::var("PCT").ok().and_then(|p| p.parse().ok()).unwrap_or(100.0);
+        let filters: Vec<Filter> = chain.split_whitespace().map(|s| Filter::parse(s).unwrap()).collect();
+        let base = CwtFile::read(std::path::Path::new(&path)).unwrap();
+        let ns = base.header.num_scales as usize;
+        for n in 0..=filters.len() {
+            let mut cwt = base.clone();
+            apply(&mut cwt, &filters[..n]);
+            cwt.set_reference(pct);
+            let gm = cwt.global_max();
+            let h: Vec<f32> = cwt.data.iter().map(|&v| crate::graphics::layout::bar_fraction(v, gm)).collect();
+            let frames = h.len() / ns;
+            let (mut fedges, mut worst) = (0usize, 0.0f32);
+            let mut tedges = 0usize;
+            for f in 0..frames {
+                let r = &h[f * ns..(f + 1) * ns];
+                for s in 0..ns - 1 {
+                    let d = (r[s + 1] - r[s]).abs();
+                    worst = worst.max(d);
+                    if d > 0.10 {
+                        fedges += 1;
+                    }
+                }
+                if f > 0 {
+                    let p = &h[(f - 1) * ns..f * ns];
+                    let mut jumps: Vec<f32> = (0..ns)
+                        .filter(|&s| r[s].max(p[s]) > 0.05)
+                        .map(|s| (20.0 * ((r[s] + 1e-3) / (p[s] + 1e-3)).log10()).abs())
+                        .collect();
+                    if jumps.len() > 10 {
+                        let mid = jumps.len() / 2;
+                        if *jumps.select_nth_unstable_by(mid, f32::total_cmp).1 > 6.0 {
+                            tedges += 1;
+                        }
+                    }
+                }
+            }
+            let name = if n == 0 { "(raw)".to_string() } else { format!("+ {:?}", filters[n - 1]) };
+            println!(
+                "EDGES {name:60} freq-edges/frame={:.2} steepest={:.2} time-edges={:.2}%",
+                fedges as f64 / frames as f64,
+                worst,
+                tedges as f64 * 100.0 / frames as f64
+            );
         }
     }
 }

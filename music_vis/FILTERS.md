@@ -13,6 +13,7 @@ visualizer with the music playing.
 - [How filters work](#how-filters-work)
 - [Filter reference](#filter-reference)
 - [Display options](#display-options)
+- [Peak re-synthesis (`--peaks`)](#peak-re-synthesis---peaks)
 - [Comparing chains side by side](#comparing-chains-side-by-side)
 - [Ordering guide](#ordering-guide)
 - [Relationships and conflicts](#relationships-and-conflicts)
@@ -101,6 +102,49 @@ These work on the phase graph's pitch deviation (in cents). Each value is weight
 | `--dev-range N` | `50` | Cents of pitch deviation shown as full blue or red. |
 | `--bar-colors note\|index` | `note` | Bar colours by musical note (pitch class: every C red, then around the colour wheel by semitone; octaves share a colour), or the old blue→red by position. |
 | `--peak-pct P` | `100` | The reference level is the P-th percentile instead of the maximum; anything above it is drawn at full height. Use `99.5` after filters that remove the floor. |
+
+## Peak re-synthesis (`--peaks`)
+
+```
+--peaks N[,secs,merge,width]          defaults: -,0.5,0,1
+```
+
+`--peaks` is not a filter: it runs once, after the whole filter chain, wherever it
+appears among a panel's options. It replaces each frame with a clean drawing of what the
+filters picked out:
+
+1. **Find peaks:** the frame's prominent peaks, using the same peak detection as
+   `fundamental` (3 dB prominence, within 30 dB of the frame's loudest).
+2. **Merge (optional):** the strongest peak absorbs every peak within `merge` octaves of
+   it. The combined peak sits at their amplitude-weighted position, with their combined
+   energy (√(a² + b²)). The next strongest remaining peak does the same, and so on.
+3. **Keep the N strongest:** N is 1 to 16.
+4. **Normalize (optional):** each peak is divided by the loudest peak within ±`secs`/2,
+   so a quiet verse reaches the same height as a loud chorus. Use `0` to keep the
+   filtered levels. Frames more than 40 dB below the song's loudest peak are not
+   raised to full height.
+5. **Redraw:** each peak becomes the lobe a pure sine tone at that frequency produces in
+   this CWT (Morlet, ω₀ = 6). `width` scales the lobe: below 1 is sharper than a real
+   tone, which separates close peaks. Where lobes overlap, the taller one is drawn.
+
+The phase-deviation graph is redrawn to match: a sine tone reads as its own frequency
+in every bin it reaches, so each lobe is white at its centre, red below it and blue
+above it.
+
+Notes:
+
+- **Merge distances:** `0.083` is about a semitone, `0.17` a whole tone, `0.25` a minor
+  third. Too large a value merges separate notes of a chord into one.
+- **Flicker:** a peak that hovers around N-th place appears and disappears from frame
+  to frame. Smoothing in the chain before it (`smooth-time`) or a smaller N helps.
+- **Comparing:** put the same chain on both panels and add `--peaks` to the right one.
+  The difference overlay then shows exactly what was removed (black) and added (white).
+
+Example:
+
+```
+./run.sh play <song> -f tilt -f contrast --peak-pct 99.5 --vs -f tilt -f contrast --peaks 6,0.5,0.1
+```
 
 ## Comparing chains side by side
 
@@ -221,8 +265,14 @@ for near-silence".
   separate neighbouring harmonics, so a larger `n` gains little.
 - **Shared harmonics:** in chords, a harmonic shared by two notes goes to the lower
   fundamental, and notes an octave apart merge.
-- **Measured effect:** with the defaults it moved about 16% of total amplitude, without
-  adding choppiness (roughness 0.28, against 0.26 unfiltered).
+- **Only the part above the dips moves:** a harmonic is lowered toward the straight line
+  between the dips on either side of it, and that amount is added on top of the
+  fundamental's peak. The curve stays continuous where it meets its neighbours, so no
+  vertical walls appear in the bars. Where a harmonic merges with a neighbouring tone
+  (a shallow dip), only the part sticking up above the dip is removed.
+- **Measured effect:** with the defaults it moved about 7% of total amplitude, without
+  adding choppiness (roughness 0.26, the same as unfiltered). Neighbouring bins never
+  differ by more than about a tenth of the bar height, the same as the raw data.
 
 ### smooth-time and flux
 

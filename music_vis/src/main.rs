@@ -3,6 +3,7 @@ mod audio;
 mod cwt_file;
 mod filters;
 mod graphics;
+mod resynth;
 
 use std::path::PathBuf;
 use winit::event_loop::EventLoop;
@@ -10,6 +11,7 @@ use app::{App, PanelData};
 use cwt_file::CwtFile;
 use filters::{Filter, FILTER_HELP};
 use graphics::{ColorMode, DisplayOptions, Layout, ScaleMode};
+use resynth::{Resynth, PEAKS_HELP};
 
 const USAGE: &str = "\
 Usage: music_vis <audio> <audio.cwt> [panel options] [--vs [panel options]]... [global options]
@@ -19,6 +21,8 @@ with default settings, so the same song can be compared under different filters)
   -f, --filter SPEC          add a filter (see below; repeat to chain)
   --scale, --db-range, --dev-range, --peak-pct   display options (see below)
   --bar-colors note|index    bar colors: by musical note (default) or by position
+  --peaks N[,secs,merge,width]  after the filters, redraw only the N strongest peaks
+                             as clean sine-tone lobes (see below)
 
 Global options:
   --phase                    also show the phase-deviation spectrogram
@@ -34,11 +38,13 @@ Keys: Space pause/resume, Left/Right seek 5 s, 1/3/2 speed 1x/0.75x/0.5x
 
 Example (side by side):
   music_vis song.flac song.cwt -f tilt -f contrast --peak-pct 99.5 --vs -f whiten -f contrast
+  music_vis song.flac song.cwt -f tilt -f contrast --vs -f tilt -f contrast --peaks 6,0.5,0.1
 ";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
     eprintln!("{FILTER_HELP}");
+    eprintln!("\n{PEAKS_HELP}");
     std::process::exit(1);
 }
 
@@ -46,6 +52,7 @@ fn usage() -> ! {
 #[derive(Default)]
 struct PanelSpec {
     filters: Vec<Filter>,
+    resynth: Option<Resynth>,
     display: DisplayOptions,
 }
 
@@ -89,6 +96,13 @@ fn main() {
                     }
                 }
             }
+            "--peaks" => match Resynth::parse(&value(&arg)) {
+                Ok(r) => spec.resynth = Some(r),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1)
+                }
+            },
             "--vs" => {
                 if specs.len() == MAX_PANELS {
                     eprintln!("--vs: at most {MAX_PANELS} panels");
@@ -131,6 +145,7 @@ fn main() {
             "--list-filters" | "-h" | "--help" => {
                 println!("{USAGE}");
                 println!("{FILTER_HELP}");
+                println!("\n{PEAKS_HELP}");
                 return;
             }
             a if a.starts_with('-') => {
@@ -157,13 +172,22 @@ fn main() {
             _ => format!("panel {} (from left)", i + 1),
         };
         let names: Vec<String> = spec.filters.iter().map(|f| format!("{f:?}")).collect();
-        println!("{label}: {}", if names.is_empty() { "no filters".into() } else { names.join(" -> ") });
+        let mut chain = if names.is_empty() { "no filters".to_string() } else { names.join(" -> ") };
+        if let Some(r) = &spec.resynth {
+            chain += &format!(" => peaks {r:?}");
+        }
+        println!("{label}: {chain}");
         if !show_phase && spec.filters.iter().any(Filter::is_phase) {
             eprintln!("  note: phase-* filters only affect the phase graph; add --phase to show it");
         }
         let mut cwt = source.clone();
         if !spec.filters.is_empty() {
             filters::apply(&mut cwt, &spec.filters);
+        }
+        if let Some(r) = &spec.resynth {
+            let start = std::time::Instant::now();
+            resynth::apply(&mut cwt, r);
+            println!("  re-synthesized peaks in {:.2}s", start.elapsed().as_secs_f32());
         }
         cwt.set_reference(spec.display.peak_pct);
         panels.push(PanelData { cwt, display: spec.display });
