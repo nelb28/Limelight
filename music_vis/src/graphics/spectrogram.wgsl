@@ -12,11 +12,15 @@ struct Params {
     global_max: f32,
     y_bottom: f32,           // NDC bottom edge of this view
     y_top: f32,              // NDC top edge of this view
-    screen_width: f32,       // pixels, for the center marker
+    center_px: f32,          // framebuffer x of the panel center, for the marker
     db_range: f32,           // dB below global max that maps to black
     dev_range: f32,          // cents of deviation that map to full blue / red
     mode: u32,
     has_phase: u32,          // 0 for CWT1 files without phase data
+    scale_mode: u32,         // 0 = dB, 1 = linear, 2 = sqrt
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -91,7 +95,7 @@ fn bilinear_dev(p: Sample) -> f32 {
 @fragment
 fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     // Dashed center marker at the current frame.
-    if abs(in.pos.x - params.screen_width * 0.5) < 1.0 && fract(in.pos.y / 12.0) < 0.5 {
+    if abs(in.pos.x - params.center_px) < 1.0 && fract(in.pos.y / 12.0) < 0.5 {
         return vec4<f32>(1.0, 1.0, 1.0, 1.0);
     }
 
@@ -113,9 +117,16 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     p.ft = fract(frame);
     p.st = fract(scale);
 
-    let m = bilinear_mag(p);
-    let db = 20.0 * log(max(m / params.global_max, 1e-9)) / log(10.0);
-    let v = clamp(1.0 + db / params.db_range, 0.0, 1.0);
+    let rel = max(bilinear_mag(p) / params.global_max, 0.0);
+    var v: f32;
+    if params.scale_mode == 1u {
+        v = clamp(rel, 0.0, 1.0);
+    } else if params.scale_mode == 2u {
+        v = clamp(sqrt(rel), 0.0, 1.0);
+    } else {
+        let db = 20.0 * log(max(rel, 1e-9)) / log(10.0);
+        v = clamp(1.0 + db / params.db_range, 0.0, 1.0);
+    }
 
     if params.mode == 0u {
         return vec4<f32>(inferno(v), 1.0);

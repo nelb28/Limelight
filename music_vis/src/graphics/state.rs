@@ -1,8 +1,19 @@
 use std::sync::Arc;
 use winit::window::Window;
 
-use super::{BarPipeline, SpectrogramPipeline};
+use super::{BarPipeline, DiffPipeline, DisplayOptions, Layout, SpectrogramPipeline};
 use crate::cwt_file::CwtFile;
+
+/// Pixels of background between side-by-side panels.
+const PANEL_GAP_PX: u32 = 8;
+
+/// One side-by-side view of the song: its own bars and spectrogram(s).
+struct Panel {
+    bars: BarPipeline,
+    spectrogram: SpectrogramPipeline,
+    /// Difference vs. the leftmost panel's bars (every panel except the first).
+    diff: Option<DiffPipeline>,
+}
 
 pub struct State {
     pub surface: wgpu::Surface<'static>,
@@ -10,13 +21,15 @@ pub struct State {
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
-    bar_pipeline: BarPipeline,
-    spectrogram_pipeline: SpectrogramPipeline,
+    layout: Layout,
+    panels: Vec<Panel>,
+    /// Draw the difference overlays (toggled with D).
+    pub show_diff: bool,
 }
 
 impl State {
-    pub async fn new(window: Arc<Window>, cwt: &CwtFile) -> Self {
-        let num_bars = cwt.header.num_scales;
+    /// One panel per (data, display options) pair, laid out left to right.
+    pub async fn new(window: Arc<Window>, panels: &[(&CwtFile, &DisplayOptions)], layout: Layout) -> Self {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::default();
@@ -54,8 +67,21 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let bar_pipeline = BarPipeline::new(&device, format, num_bars);
-        let spectrogram_pipeline = SpectrogramPipeline::new(&device, format, cwt);
+        let panels = panels
+            .iter()
+            .enumerate()
+            .map(|(i, (cwt, display))| Panel {
+                diff: (i > 0).then(|| DiffPipeline::new(&device, format, cwt.header.num_scales)),
+                bars: BarPipeline::new(
+                    &device,
+                    format,
+                    cwt.header.num_scales,
+                    cwt.pitch_mapping(),
+                    display.bar_colors,
+                ),
+                spectrogram: SpectrogramPipeline::new(&device, format, cwt, display, &layout),
+            })
+            .collect();
 
         Self {
             surface,
@@ -63,8 +89,9 @@ impl State {
             queue,
             config,
             size,
-            bar_pipeline,
-            spectrogram_pipeline,
+            layout,
+            panels,
+            show_diff: true,
         }
     }
 
@@ -77,13 +104,27 @@ impl State {
         }
     }
 
-    pub fn update_magnitudes(&self, magnitudes: &[f32], global_max: f32) {
-        self.bar_pipeline.update(&self.queue, magnitudes, global_max);
+    /// Pixel x offset and width of panel `i`.
+    fn panel_rect(&self, i: usize) -> (u32, u32) {
+        let n = self.panels.len() as u32;
+        let gaps = PANEL_GAP_PX * (n - 1);
+        let width = (self.config.width.saturating_sub(gaps) / n).max(1);
+        (i as u32 * (width + PANEL_GAP_PX), width)
     }
 
-    pub fn update_spectrogram(&mut self, center_frame: f32) {
-        self.spectrogram_pipeline
-            .update(&self.queue, center_frame, self.config.width);
+    /// Upload panel `i`'s difference overlay: (reference, panel i) bar-area fractions per bin.
+    pub fn update_diff(&mut self, i: usize, heights: &[[f32; 2]]) {
+        if let Some(diff) = &self.panels[i].diff {
+            diff.update(&self.queue, heights, &self.layout);
+        }
+    }
+
+    /// Update panel `i` for the current playhead position.
+    pub fn update_panel(&mut self, i: usize, magnitudes: &[f32], global_max: f32, center_frame: f32) {
+        let (x, width) = self.panel_rect(i);
+        let panel = &mut self.panels[i];
+        panel.bars.update(&self.queue, magnitudes, global_max, &self.layout);
+        panel.spectrogram.update(&self.queue, center_frame, x as f32 + width as f32 / 2.0);
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -117,8 +158,18 @@ impl State {
                 multiview_mask: None,
             });
 
-            self.bar_pipeline.draw(&mut rpass);
-            self.spectrogram_pipeline.draw(&mut rpass);
+            let height = self.config.height as f32;
+            for i in 0..self.panels.len() {
+                let (x, width) = self.panel_rect(i);
+                rpass.set_viewport(x as f32, 0.0, width as f32, height, 0.0, 1.0);
+                self.panels[i].bars.draw(&mut rpass);
+                if self.show_diff {
+                    if let Some(diff) = &self.panels[i].diff {
+                        diff.draw(&mut rpass);
+                    }
+                }
+                self.panels[i].spectrogram.draw(&mut rpass);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));

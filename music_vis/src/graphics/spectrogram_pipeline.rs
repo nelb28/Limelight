@@ -1,20 +1,55 @@
 use bytemuck::{bytes_of, cast_slice, Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use super::Layout;
 use crate::cwt_file::CwtFile;
 
 /// Seconds of history and of lookahead shown on each side of the playhead.
 pub const HALF_WINDOW_SECS: f32 = 3.0;
 
-/// Screen layout in NDC y (bottom, top). Bars fill from y = -1 up to `BARS_TOP`.
-pub const PHASE_REGION: (f32, f32) = (0.45, 1.0);
-pub const MAGNITUDE_REGION: (f32, f32) = (-0.15, 0.40);
-pub const BARS_TOP: f32 = -0.20;
 
-/// Magnitudes this many dB below the file's max are drawn black.
-const DB_RANGE: f32 = 50.0;
-/// Pitch deviation (cents) that maps to fully blue / red. 50 cents = a quarter tone.
-const DEV_RANGE: f32 = 50.0;
+/// How magnitudes map to color intensity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScaleMode {
+    Db = 0,
+    Linear = 1,
+    Sqrt = 2,
+}
+
+/// How the bars are colored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColorMode {
+    /// Blue (low) to red (high) by position.
+    Classic = 0,
+    /// Hue by musical note (pitch class): every C the same hue, every C# the next...
+    Note = 1,
+}
+
+/// Display settings chosen on the command line.
+#[derive(Debug, Clone)]
+pub struct DisplayOptions {
+    pub scale: ScaleMode,
+    /// Magnitudes this many dB below the max are drawn black (Db scale only).
+    pub db_range: f32,
+    /// Pitch deviation (cents) that maps to fully blue / red. 50 cents = a quarter tone.
+    pub dev_range: f32,
+    /// Percentile of magnitudes mapped to full bar height / color (100 = max).
+    pub peak_pct: f32,
+    /// Bar colors (default: by note).
+    pub bar_colors: ColorMode,
+}
+
+impl Default for DisplayOptions {
+    fn default() -> Self {
+        Self {
+            scale: ScaleMode::Db,
+            db_range: 50.0,
+            dev_range: 50.0,
+            peak_pct: 100.0,
+            bar_colors: ColorMode::Note,
+        }
+    }
+}
 
 const MODE_MAGNITUDE: u32 = 0;
 const MODE_PHASE: u32 = 1;
@@ -29,11 +64,15 @@ struct Params {
     global_max: f32,
     y_bottom: f32,
     y_top: f32,
-    screen_width: f32,
+    center_px: f32,
     db_range: f32,
     dev_range: f32,
     mode: u32,
     has_phase: u32,
+    scale_mode: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// One spectrogram view: its own region and color mode, sharing the data buffers.
@@ -79,7 +118,13 @@ fn upload_storage(device: &wgpu::Device, label: &str, data: &[f32]) -> wgpu::Buf
 }
 
 impl SpectrogramPipeline {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, cwt: &CwtFile) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        cwt: &CwtFile,
+        display: &DisplayOptions,
+        layout: &Layout,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("spectrogram shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("spectrogram.wgsl").into()),
@@ -139,11 +184,13 @@ impl SpectrogramPipeline {
         });
 
         let has_phase = !cwt.phase_dev.is_empty();
-        if !has_phase {
+        if layout.phase.is_some() && !has_phase {
             eprintln!("note: CWT file has no phase data (CWT1); re-run cwt to enable the phase graph");
         }
         let mags_buf = upload_storage(device, "spectrogram magnitudes", &cwt.data);
-        let phase_buf = upload_storage(device, "spectrogram phase deviation", &cwt.phase_dev);
+        // Phase data only goes to the GPU when the phase graph is shown.
+        let phase_data: &[f32] = if layout.phase.is_some() { &cwt.phase_dev } else { &[] };
+        let phase_buf = upload_storage(device, "spectrogram phase deviation", phase_data);
 
         let global_max = cwt.global_max();
         let base = Params {
@@ -154,14 +201,22 @@ impl SpectrogramPipeline {
             global_max: if global_max > 0.0 { global_max } else { 1.0 },
             y_bottom: 0.0,
             y_top: 0.0,
-            screen_width: 1.0,
-            db_range: DB_RANGE,
-            dev_range: DEV_RANGE,
+            center_px: 0.0,
+            db_range: display.db_range,
+            dev_range: display.dev_range,
             mode: MODE_MAGNITUDE,
             has_phase: has_phase as u32,
+            scale_mode: display.scale as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
 
-        let views = [(MODE_MAGNITUDE, MAGNITUDE_REGION), (MODE_PHASE, PHASE_REGION)]
+        let mut regions = vec![(MODE_MAGNITUDE, layout.magnitude)];
+        if let Some(phase) = layout.phase {
+            regions.push((MODE_PHASE, phase));
+        }
+        let views = regions
             .into_iter()
             .map(|(mode, (y_bottom, y_top))| {
                 let params = Params { mode, y_bottom, y_top, ..base };
@@ -186,11 +241,12 @@ impl SpectrogramPipeline {
         Self { pipeline, views }
     }
 
-    /// Move both views to the fractional CWT frame at the playhead.
-    pub fn update(&mut self, queue: &wgpu::Queue, center_frame: f32, screen_width: u32) {
+    /// Move the views to the fractional CWT frame at the playhead. `center_px` is the
+    /// x pixel (framebuffer coordinates) of the panel's center, for the playhead marker.
+    pub fn update(&mut self, queue: &wgpu::Queue, center_frame: f32, center_px: f32) {
         for view in &mut self.views {
             view.params.center_frame = center_frame;
-            view.params.screen_width = screen_width as f32;
+            view.params.center_px = center_px;
             queue.write_buffer(&view.params_buf, 0, bytes_of(&view.params));
         }
     }

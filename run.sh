@@ -24,7 +24,12 @@ Commands:
   build                     Build cwt and music_vis (release)
   convert [music] [pcm]     Convert audio to PCM + .sr (skips already converted)
   cwt  <song> [--force]     Run CWT processing on one song (skips if .cwt exists unless --force)
-  play <song>               Open the visualizer for one song (runs cwt first if needed)
+  play <song> [opts...]     Open the visualizer for one song (runs cwt first if needed).
+                            Extra options go to music_vis, e.g. -f tilt -f contrast --peak-pct 99.5
+                            Compare side by side: ... -f tilt --vs -f whiten   (--phase adds phase graph)
+                            Fullscreen by default (--windowed to opt out); F11 toggles, Esc quits
+                            Keys 1/3/2 set playback speed to 1x / 0.75x / 0.5x
+  filters                   List visualizer filters and display options
   list                      List songs: [cwt] processed, [old] needs reprocessing for phase
 USAGE
   exit 1
@@ -53,9 +58,12 @@ resolve_song() {
   done
   # Fuzzy search by name
   local matches=()
-  while IFS= read -r f; do matches+=("$f"); done < <(
-    find "$MUSIC" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.wav' -o -iname '*.ogg' \) \
-      | grep -iF -- "$1" | sort)
+  # Compare with curly quotes folded to straight ones, so typing "They're" finds "They’re".
+  local nq="${1//[’‘]/\'}" nf
+  while IFS= read -r f; do
+    nf="${f//[’‘]/\'}"
+    [[ "${nf,,}" == *"${nq,,}"* ]] && matches+=("$f")
+  done < <(find "$MUSIC" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.wav' -o -iname '*.ogg' \) | sort)
   if [[ ${#matches[@]} -eq 1 ]]; then
     AUDIO="${matches[0]}"; REL="${AUDIO#"$MUSIC"/}"; REL="${REL%.*}"; return
   elif [[ ${#matches[@]} -eq 0 ]]; then
@@ -103,7 +111,12 @@ case "$cmd" in
     [[ $# -ge 1 ]] || usage
     resolve_song "$1"; run_cwt
     ensure_built "$ROOT/music_vis" "$VIS_BIN"
-    "$VIS_BIN" "$AUDIO" "$PCM/$REL.cwt"
+    shift
+    "$VIS_BIN" "$AUDIO" "$PCM/$REL.cwt" "$@"
+    ;;
+  filters)
+    ensure_built "$ROOT/music_vis" "$VIS_BIN"
+    "$VIS_BIN" --list-filters
     ;;
   list)
     find "$MUSIC" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.wav' -o -iname '*.ogg' \) | sort |

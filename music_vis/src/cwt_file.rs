@@ -4,6 +4,7 @@ use std::path::Path;
 const MAGIC_V1: &[u8; 4] = b"CWT1"; // magnitudes only
 const MAGIC_V2: &[u8; 4] = b"CWT2"; // magnitudes + phase deviation
 
+#[derive(Clone)]
 pub struct CwtHeader {
     pub num_scales: u32,
     pub num_frames: u32,
@@ -12,6 +13,7 @@ pub struct CwtHeader {
     pub frequencies: Vec<f32>,
 }
 
+#[derive(Clone)]
 pub struct CwtFile {
     pub header: CwtHeader,
     /// Row-major: data[frame_idx * num_scales + scale_idx]
@@ -99,6 +101,29 @@ impl CwtFile {
         Ok(Self::new(num_scales, num_frames, sample_rate, frame_rate, frequencies, data, phase_dev))
     }
 
+    /// Set the reference level that maps to full bar height / full color to the
+    /// `pct`-th percentile of `data` (100 = absolute max). Call after filtering.
+    pub fn set_reference(&mut self, pct: f32) {
+        self.global_max = percentile(&self.data, pct);
+    }
+
+    /// Pitch of the bins for note coloring: (semitones above C of bin 0, bins per
+    /// octave). Bins are log-spaced; pitch is measured with A4 = 440 Hz, so bin `i`
+    /// has pitch class `((offset + 12 * i / bins_per_octave) / 12).fract()` (C = 0).
+    pub fn pitch_mapping(&self) -> (f32, f32) {
+        let f = &self.header.frequencies;
+        let n = f.len();
+        let bins_per_octave = if n > 1 && f[n - 1] > f[0] {
+            (n - 1) as f32 / (f[n - 1] / f[0]).log2()
+        } else {
+            48.0
+        };
+        let f0 = f.first().copied().unwrap_or(440.0).max(1e-3);
+        // Semitones from C: A is 9 semitones above C.
+        let offset = 12.0 * (f0 / 440.0).log2() + 9.0;
+        (offset, bins_per_octave)
+    }
+
     /// Global maximum magnitude across all frames and scales.
     pub fn global_max(&self) -> f32 {
         self.global_max
@@ -121,5 +146,32 @@ impl CwtFile {
             result.push(a + (b - a) * frac);
         }
         result
+    }
+}
+
+/// The `pct`-th percentile (0 < pct <= 100) of `data`, nearest-rank; 0 if empty.
+fn percentile(data: &[f32], pct: f32) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    if pct >= 100.0 {
+        return data.iter().cloned().fold(f32::MIN, f32::max);
+    }
+    let mut v = data.to_vec();
+    let rank = ((pct / 100.0 * v.len() as f32).ceil() as usize).clamp(1, v.len()) - 1;
+    *v.select_nth_unstable_by(rank, f32::total_cmp).1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentile_reference() {
+        let data: Vec<f32> = (1..=100).map(|i| i as f32).collect();
+        assert_eq!(percentile(&data, 100.0), 100.0);
+        assert_eq!(percentile(&data, 99.0), 99.0);
+        assert_eq!(percentile(&data, 50.0), 50.0);
+        assert_eq!(percentile(&[], 99.0), 0.0);
     }
 }

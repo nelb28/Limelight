@@ -5,8 +5,12 @@ use bytemuck::{bytes_of, cast_slice, Pod, Zeroable};
 struct Params {
     num_bars: u32,
     global_max: f32,
-    max_height: f32, // NDC height of a full-scale bar (bars start at y = -1)
-    _pad1: u32,
+    max_height: f32,      // NDC height of the bar area (bars start at y = -1)
+    reference_frac: f32,  // fraction of max_height reached at the reference level
+    pitch_offset: f32,    // semitones above C of bin 0 (A4 = 440 Hz)
+    bins_per_octave: f32,
+    color_mode: u32,      // 0 = by position (blue -> red), 1 = by note
+    _pad: u32,
 }
 
 pub struct BarPipeline {
@@ -15,10 +19,19 @@ pub struct BarPipeline {
     magnitude_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     num_bars: u32,
+    pitch_offset: f32,
+    bins_per_octave: f32,
+    color_mode: u32,
 }
 
 impl BarPipeline {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, num_bars: u32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        num_bars: u32,
+        (pitch_offset, bins_per_octave): (f32, f32),
+        colors: super::ColorMode,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bars shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("bars.wgsl").into()),
@@ -84,7 +97,7 @@ impl BarPipeline {
 
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bars params"),
-            size: 16,
+            size: std::mem::size_of::<Params>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -117,15 +130,22 @@ impl BarPipeline {
             magnitude_buf,
             bind_group,
             num_bars,
+            pitch_offset,
+            bins_per_octave,
+            color_mode: colors as u32,
         }
     }
 
-    pub fn update(&self, queue: &wgpu::Queue, magnitudes: &[f32], global_max: f32) {
+    pub fn update(&self, queue: &wgpu::Queue, magnitudes: &[f32], global_max: f32, layout: &super::Layout) {
         let params = Params {
             num_bars: self.num_bars,
             global_max,
-            max_height: 1.0 + super::BARS_TOP,
-            _pad1: 0,
+            max_height: layout.bar_height(),
+            reference_frac: super::layout::BAR_REFERENCE_FRACTION,
+            pitch_offset: self.pitch_offset,
+            bins_per_octave: self.bins_per_octave,
+            color_mode: self.color_mode,
+            _pad: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytes_of(&params));
         queue.write_buffer(&self.magnitude_buf, 0, cast_slice(magnitudes));
@@ -134,6 +154,7 @@ impl BarPipeline {
     pub fn draw<'rp>(&'rp self, rpass: &mut wgpu::RenderPass<'rp>) {
         rpass.set_pipeline(&self.pipeline);
         rpass.set_bind_group(0, &self.bind_group, &[]);
-        rpass.draw(0..6, 0..self.num_bars);
+        // One quad per segment between neighboring bins (a continuous filled area).
+        rpass.draw(0..6, 0..self.num_bars.saturating_sub(1));
     }
 }
