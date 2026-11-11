@@ -5,7 +5,7 @@ use bytemuck::{bytes_of, cast_slice, Pod, Zeroable};
 struct Params {
     num_bars: u32,
     global_max: f32,
-    _pad0: u32,
+    max_height: f32, // NDC height of a full-scale bar (bars start at y = -1)
     _pad1: u32,
 }
 
@@ -124,7 +124,7 @@ impl BarPipeline {
         let params = Params {
             num_bars: self.num_bars,
             global_max,
-            _pad0: 0,
+            max_height: 1.0 + super::BARS_TOP,
             _pad1: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytes_of(&params));

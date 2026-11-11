@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use winit::window::Window;
 
-use super::{BarPipeline, WaveformPipeline};
+use super::{BarPipeline, SpectrogramPipeline};
+use crate::cwt_file::CwtFile;
 
 pub struct State {
     pub surface: wgpu::Surface<'static>,
@@ -10,11 +11,12 @@ pub struct State {
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
     bar_pipeline: BarPipeline,
-    waveform_pipeline: WaveformPipeline,
+    spectrogram_pipeline: SpectrogramPipeline,
 }
 
 impl State {
-    pub async fn new(window: Arc<Window>, num_bars: u32) -> Self {
+    pub async fn new(window: Arc<Window>, cwt: &CwtFile) -> Self {
+        let num_bars = cwt.header.num_scales;
         let size = window.inner_size();
 
         let instance = wgpu::Instance::default();
@@ -29,7 +31,12 @@ impl State {
         ).await.unwrap();
 
         let (device, queue) = adapter.request_device(
-            &wgpu::DeviceDescriptor::default(),
+            // Use the adapter's real limits: the whole CWT is uploaded as one storage
+            // buffer, which can exceed the conservative 128 MiB default for long songs.
+            &wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(),
+                ..Default::default()
+            },
         ).await.unwrap();
 
         let surface_caps = surface.get_capabilities(&adapter);
@@ -48,7 +55,7 @@ impl State {
         surface.configure(&device, &config);
 
         let bar_pipeline = BarPipeline::new(&device, format, num_bars);
-        let waveform_pipeline = WaveformPipeline::new(&device, format);
+        let spectrogram_pipeline = SpectrogramPipeline::new(&device, format, cwt);
 
         Self {
             surface,
@@ -57,7 +64,7 @@ impl State {
             config,
             size,
             bar_pipeline,
-            waveform_pipeline,
+            spectrogram_pipeline,
         }
     }
 
@@ -74,8 +81,9 @@ impl State {
         self.bar_pipeline.update(&self.queue, magnitudes, global_max);
     }
 
-    pub fn update_waveform(&self, samples: &[f32]) {
-        self.waveform_pipeline.update(&self.queue, samples);
+    pub fn update_spectrogram(&mut self, center_frame: f32) {
+        self.spectrogram_pipeline
+            .update(&self.queue, center_frame, self.config.width);
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -110,7 +118,7 @@ impl State {
             });
 
             self.bar_pipeline.draw(&mut rpass);
-            self.waveform_pipeline.draw(&mut rpass);
+            self.spectrogram_pipeline.draw(&mut rpass);
         }
 
         self.queue.submit(Some(encoder.finish()));

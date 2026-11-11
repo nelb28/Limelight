@@ -1,7 +1,8 @@
 use std::io::{self, Read};
 use std::path::Path;
 
-const MAGIC: &[u8; 4] = b"CWT1";
+const MAGIC_V1: &[u8; 4] = b"CWT1"; // magnitudes only
+const MAGIC_V2: &[u8; 4] = b"CWT2"; // magnitudes + phase deviation
 
 pub struct CwtHeader {
     pub num_scales: u32,
@@ -15,6 +16,9 @@ pub struct CwtFile {
     pub header: CwtHeader,
     /// Row-major: data[frame_idx * num_scales + scale_idx]
     pub data: Vec<f32>,
+    /// Instantaneous-frequency deviation in cents, same layout as `data`.
+    /// Empty for CWT1 files (processed before phase support).
+    pub phase_dev: Vec<f32>,
     global_max: f32,
 }
 
@@ -26,6 +30,7 @@ impl CwtFile {
         frame_rate: u32,
         frequencies: Vec<f32>,
         data: Vec<f32>,
+        phase_dev: Vec<f32>,
     ) -> Self {
         let global_max = data.iter().cloned().fold(0.0f32, f32::max);
         Self {
@@ -37,6 +42,7 @@ impl CwtFile {
                 frequencies,
             },
             data,
+            phase_dev,
             global_max,
         }
     }
@@ -46,12 +52,16 @@ impl CwtFile {
 
         let mut magic = [0u8; 4];
         f.read_exact(&mut magic)?;
-        if &magic != MAGIC {
+        let has_phase = if &magic == MAGIC_V2 {
+            true
+        } else if &magic == MAGIC_V1 {
+            false
+        } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("bad magic: expected CWT1, got {:?}", magic),
+                format!("bad magic: expected CWT1/CWT2, got {:?}", magic),
             ));
-        }
+        };
 
         let read_u32 = |f: &mut std::fs::File| -> io::Result<u32> {
             let mut buf = [0u8; 4];
@@ -75,12 +85,18 @@ impl CwtFile {
         }
 
         let data_len = (num_scales * num_frames) as usize;
-        let mut data = Vec::with_capacity(data_len);
-        for _ in 0..data_len {
-            data.push(read_f32(&mut f)?);
-        }
+        let read_block = |f: &mut std::fs::File| -> io::Result<Vec<f32>> {
+            let mut bytes = vec![0u8; data_len * 4];
+            f.read_exact(&mut bytes)?;
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect())
+        };
+        let data = read_block(&mut f)?;
+        let phase_dev = if has_phase { read_block(&mut f)? } else { Vec::new() };
 
-        Ok(Self::new(num_scales, num_frames, sample_rate, frame_rate, frequencies, data))
+        Ok(Self::new(num_scales, num_frames, sample_rate, frame_rate, frequencies, data, phase_dev))
     }
 
     /// Global maximum magnitude across all frames and scales.

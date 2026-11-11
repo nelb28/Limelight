@@ -11,7 +11,7 @@ use wavelets::{Morlet, Wavelet};
 use scales::log_scales;
 use kernel::wavelet_kernel;
 use batch::BatchCwt;
-use frames::reduce_to_frames;
+use frames::{reduce_phase_deviation, reduce_to_frames};
 use cwt_file::CwtFile;
 
 use std::path::PathBuf;
@@ -101,13 +101,18 @@ fn main() {
 
     let num_frames = (mono.len() + hop_size - 1) / hop_size;
     let mut all_frames: Vec<f32> = Vec::with_capacity(num_frames * num_scales);
+    let mut all_phase: Vec<f32> = Vec::with_capacity(num_frames * num_scales);
 
     println!("Processing {} scales...", num_scales);
     let start = Instant::now();
     for (i, &scale) in scales.iter().enumerate() {
-        let mags = batch.transform_scale(&morlet, scale, dt, ts);
+        let coeffs = batch.transform_scale(&morlet, scale, dt, ts);
+        let mags: Vec<f64> = coeffs.iter().map(|c| c.norm()).collect();
         let frame_vals = reduce_to_frames(&mags, hop_size, window_size);
         all_frames.extend(frame_vals.iter().map(|&v| v as f32));
+        drop(mags);
+        let dev = reduce_phase_deviation(&coeffs, hop_size, window_size, frequencies[i] as f64, dt);
+        all_phase.extend(dev.iter().map(|&v| v as f32));
         if (i + 1) % 50 == 0 || i + 1 == num_scales {
             println!(
                 "  {}/{} scales ({:.0} Hz)",
@@ -121,12 +126,17 @@ fn main() {
 
     // Rearrange from scale-major to frame-major layout
     let actual_num_frames = all_frames.len() / num_scales;
-    let mut frame_major: Vec<f32> = vec![0.0; all_frames.len()];
-    for s in 0..num_scales {
-        for f in 0..actual_num_frames {
-            frame_major[f * num_scales + s] = all_frames[s * actual_num_frames + f];
+    let to_frame_major = |scale_major: &[f32]| {
+        let mut out = vec![0.0f32; scale_major.len()];
+        for s in 0..num_scales {
+            for f in 0..actual_num_frames {
+                out[f * num_scales + s] = scale_major[s * actual_num_frames + f];
+            }
         }
-    }
+        out
+    };
+    let frame_major = to_frame_major(&all_frames);
+    let phase_major = to_frame_major(&all_phase);
 
     let cwt = CwtFile::new(
         num_scales as u32,
@@ -135,6 +145,7 @@ fn main() {
         frame_rate,
         frequencies,
         frame_major,
+        phase_major,
     );
 
     println!("Writing: {}", output_path.display());

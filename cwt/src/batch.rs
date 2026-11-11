@@ -25,14 +25,15 @@ impl BatchCwt {
         }
     }
 
-    /// Compute CWT for one scale via overlap-save, returning per-sample magnitudes.
+    /// Compute CWT for one scale via overlap-save, returning per-sample complex
+    /// coefficients aligned so that output[n] is centered on input sample n.
     pub fn transform_scale<W: Wavelet>(
         &mut self,
         wavelet: &W,
         scale: f64,
         dt: f64,
         ts: f64,
-    ) -> Vec<f64> {
+    ) -> Vec<Complex64> {
         let kernel = wavelet_kernel(wavelet, scale, dt, ts);
         let kernel_len = kernel.len();
         let signal_len = self.signal.len();
@@ -61,11 +62,16 @@ impl BatchCwt {
         let ifft = self.planner.plan_fft_inverse(fft_size);
         let norm = 1.0 / fft_size as f64;
 
-        let mut output = vec![0.0f64; signal_len];
+        // The kernel spans t in [-ts*scale, +ts*scale], so the causal convolution
+        // output is delayed by half the kernel length. Compute `delay` extra causal
+        // samples and drop the first `delay` so output[n] is centered on sample n.
+        let delay = (kernel_len - 1) / 2;
+        let causal_len = signal_len + delay;
+        let mut output = vec![Complex64::new(0.0, 0.0); signal_len];
 
-        // Overlap-save: step through output in strides of valid_size.
+        // Overlap-save: step through causal output in strides of valid_size.
         let mut out_pos = 0usize;
-        while out_pos < signal_len {
+        while out_pos < causal_len {
             // Input block starts (kernel_len - 1) samples before out_pos,
             // so that the circular-convolution's valid region aligns.
             let overlap = kernel_len - 1;
@@ -75,7 +81,7 @@ impl BatchCwt {
             // Build the input block of exactly fft_size samples.
             let mut block = vec![Complex::new(0.0f64, 0.0); fft_size];
             let sig_start = in_start;
-            let sig_end = (in_start + fft_size - leading_zeros).min(signal_len);
+            let sig_end = (in_start + fft_size - leading_zeros).min(signal_len).max(sig_start);
             for (i, &s) in self.signal[sig_start..sig_end].iter().enumerate() {
                 block[leading_zeros + i] = Complex::new(s, 0.0);
             }
@@ -89,11 +95,13 @@ impl BatchCwt {
             ifft.process(&mut block);
 
             // Copy valid output samples (indices overlap..fft_size-1).
-            let valid_count = valid_size.min(signal_len - out_pos);
+            let valid_count = valid_size.min(causal_len - out_pos);
             for i in 0..valid_count {
-                let c = block[overlap + i];
-                output[out_pos + i] =
-                    Complex64::new(c.re * norm, c.im * norm).norm();
+                let causal_idx = out_pos + i;
+                if causal_idx >= delay {
+                    let c = block[overlap + i];
+                    output[causal_idx - delay] = Complex64::new(c.re * norm, c.im * norm);
+                }
             }
 
             out_pos += valid_size;
@@ -129,11 +137,43 @@ mod tests {
         let max_kernel_len = kernel_on.len().max(kernel_off.len());
 
         let mut batch = BatchCwt::new(&signal, max_kernel_len);
-        let mags_on = batch.transform_scale(&morlet, scale_on, dt, ts);
-        let mags_off = batch.transform_scale(&morlet, scale_off, dt, ts);
+        let mags_on: Vec<f64> = batch.transform_scale(&morlet, scale_on, dt, ts).iter().map(|c| c.norm()).collect();
+        let mags_off: Vec<f64> = batch.transform_scale(&morlet, scale_off, dt, ts).iter().map(|c| c.norm()).collect();
 
         let peak_on: f64 = mags_on.iter().cloned().fold(0.0, f64::max);
         let peak_off: f64 = mags_off.iter().cloned().fold(0.0, f64::max);
         assert!(peak_on > peak_off * 3.0, "on={peak_on}, off={peak_off}");
+    }
+
+    #[test]
+    fn test_output_centered_on_impulse() {
+        // A low-frequency (long) kernel must not delay its response.
+        let morlet = Morlet::standard();
+        let dt = 1.0 / 1000.0;
+        let mut signal = vec![0.0; 4000];
+        signal[2000] = 1.0;
+        let scale = morlet.freq_to_scale(20.0);
+        let k = wavelet_kernel(&morlet, scale, dt, 8.0).len();
+        let mut batch = BatchCwt::new(&signal, k);
+        let out = batch.transform_scale(&morlet, scale, dt, 8.0);
+        let peak = (0..out.len()).max_by(|&a, &b| out[a].norm().total_cmp(&out[b].norm())).unwrap();
+        assert!((peak as i64 - 2000).abs() <= 1, "peak at {peak}, expected 2000");
+    }
+
+    #[test]
+    fn test_phase_deviation_end_to_end() {
+        // A real 445 Hz sine analysed in the 440 Hz bin should read ~+19.6 cents.
+        let morlet = Morlet::standard();
+        let rate = 44100.0;
+        let dt = 1.0 / rate;
+        let signal: Vec<f64> = (0..44100).map(|i| (2.0 * PI * 445.0 * i as f64 * dt).sin()).collect();
+        let scale = morlet.freq_to_scale(440.0);
+        let k = wavelet_kernel(&morlet, scale, dt, 8.0).len();
+        let mut batch = BatchCwt::new(&signal, k);
+        let coeffs = batch.transform_scale(&morlet, scale, dt, 8.0);
+        let dev = crate::frames::reduce_phase_deviation(&coeffs, 735, 1470, 440.0, dt);
+        let expected = 1200.0 * (445.0f64 / 440.0).log2();
+        let mid = dev[dev.len() / 2];
+        assert!((mid - expected).abs() < 1.0, "got {mid}, expected {expected}");
     }
 }

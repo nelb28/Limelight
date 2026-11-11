@@ -1,7 +1,9 @@
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
-pub const MAGIC: &[u8; 4] = b"CWT1";
+/// CWT1: header + magnitudes. CWT2: CWT1 + phase deviation (cents), same layout.
+pub const MAGIC: &[u8; 4] = b"CWT2";
+const MAGIC_V1: &[u8; 4] = b"CWT1";
 
 pub struct CwtHeader {
     pub num_scales: u32,
@@ -15,6 +17,9 @@ pub struct CwtFile {
     pub header: CwtHeader,
     /// Row-major: data[frame_idx * num_scales + scale_idx]
     pub data: Vec<f32>,
+    /// Instantaneous-frequency deviation from each bin's center, in cents.
+    /// Same layout as `data`. Empty for CWT1 files.
+    pub phase_dev: Vec<f32>,
 }
 
 impl CwtFile {
@@ -25,9 +30,11 @@ impl CwtFile {
         frame_rate: u32,
         frequencies: Vec<f32>,
         data: Vec<f32>,
+        phase_dev: Vec<f32>,
     ) -> Self {
         assert_eq!(frequencies.len(), num_scales as usize);
         assert_eq!(data.len(), (num_scales * num_frames) as usize);
+        assert!(phase_dev.is_empty() || phase_dev.len() == data.len());
         Self {
             header: CwtHeader {
                 num_scales,
@@ -37,11 +44,12 @@ impl CwtFile {
                 frequencies,
             },
             data,
+            phase_dev,
         }
     }
 
     pub fn write(&self, path: &Path) -> io::Result<()> {
-        let mut f = std::fs::File::create(path)?;
+        let mut f = BufWriter::new(std::fs::File::create(path)?);
         f.write_all(MAGIC)?;
         f.write_all(&self.header.num_scales.to_le_bytes())?;
         f.write_all(&self.header.num_frames.to_le_bytes())?;
@@ -50,10 +58,10 @@ impl CwtFile {
         for &freq in &self.header.frequencies {
             f.write_all(&freq.to_le_bytes())?;
         }
-        for &val in &self.data {
+        for &val in self.data.iter().chain(self.phase_dev.iter()) {
             f.write_all(&val.to_le_bytes())?;
         }
-        Ok(())
+        f.flush()
     }
 
     pub fn read(path: &Path) -> io::Result<Self> {
@@ -61,12 +69,16 @@ impl CwtFile {
 
         let mut magic = [0u8; 4];
         f.read_exact(&mut magic)?;
-        if &magic != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bad magic: expected CWT1, got {:?}", magic),
-            ));
-        }
+        let has_phase = match &magic {
+            m if m == MAGIC => true,
+            m if m == MAGIC_V1 => false,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad magic: expected CWT1/CWT2, got {:?}", magic),
+                ))
+            }
+        };
 
         let read_u32 = |f: &mut std::fs::File| -> io::Result<u32> {
             let mut buf = [0u8; 4];
@@ -94,8 +106,15 @@ impl CwtFile {
         for _ in 0..data_len {
             data.push(read_f32(&mut f)?);
         }
+        let mut phase_dev = Vec::new();
+        if has_phase {
+            phase_dev.reserve(data_len);
+            for _ in 0..data_len {
+                phase_dev.push(read_f32(&mut f)?);
+            }
+        }
 
-        Ok(Self::new(num_scales, num_frames, sample_rate, frame_rate, frequencies, data))
+        Ok(Self::new(num_scales, num_frames, sample_rate, frame_rate, frequencies, data, phase_dev))
     }
 }
 
@@ -107,7 +126,8 @@ mod tests {
     fn test_round_trip() {
         let frequencies = vec![20.0, 100.0, 1000.0, 10000.0];
         let data = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
-        let cwt = CwtFile::new(4, 2, 96000, 60, frequencies.clone(), data.clone());
+        let phase: Vec<f32> = data.iter().map(|v| v * -100.0).collect();
+        let cwt = CwtFile::new(4, 2, 96000, 60, frequencies.clone(), data.clone(), phase.clone());
 
         let dir = std::env::temp_dir().join("cwt_test_file");
         std::fs::create_dir_all(&dir).unwrap();
@@ -124,6 +144,7 @@ mod tests {
         for (a, b) in loaded.data.iter().zip(data.iter()) {
             assert!((a - b).abs() < 1e-6);
         }
+        assert_eq!(loaded.phase_dev, phase);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

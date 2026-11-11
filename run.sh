@@ -25,7 +25,7 @@ Commands:
   convert [music] [pcm]     Convert audio to PCM + .sr (skips already converted)
   cwt  <song> [--force]     Run CWT processing on one song (skips if .cwt exists unless --force)
   play <song>               Open the visualizer for one song (runs cwt first if needed)
-  list                      List songs and whether they have a .cwt
+  list                      List songs: [cwt] processed, [old] needs reprocessing for phase
 USAGE
   exit 1
 }
@@ -74,7 +74,10 @@ run_cwt() {
     echo "No PCM for '$REL'. Run: ./run.sh convert" >&2; exit 1
   fi
   if [[ -f "$cwt" && "$force" != "--force" ]]; then
-    echo ">> $REL.cwt already exists (use --force to redo)"; return
+    if [[ "$(head -c 4 "$cwt")" == "CWT2" ]]; then
+      echo ">> $REL.cwt already exists (use --force to redo)"; return
+    fi
+    echo ">> $REL.cwt is an old CWT1 file without phase data; regenerating"
   fi
   if [[ ! -f "$PCM/$REL.sr" ]]; then
     echo "warning: no .sr file for '$REL'; cwt will assume 96000 Hz" >&2
@@ -106,7 +109,9 @@ case "$cmd" in
     find "$MUSIC" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.wav' -o -iname '*.ogg' \) | sort |
     while IFS= read -r f; do
       r="${f#"$MUSIC"/}"; r="${r%.*}"
-      [[ -f "$PCM/$r.cwt" ]] && mark="[cwt]" || mark="[   ]"
+      if [[ ! -f "$PCM/$r.cwt" ]]; then mark="[   ]"
+      elif [[ "$(head -c 4 "$PCM/$r.cwt")" == "CWT2" ]]; then mark="[cwt]"
+      else mark="[old]"; fi
       echo "$mark $r"
     done
     ;;

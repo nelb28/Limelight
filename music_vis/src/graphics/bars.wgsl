@@ -1,7 +1,7 @@
 struct Params {
     num_bars: u32,
     global_max: f32,
-    _pad0: u32,
+    max_height: f32,
     _pad1: u32,
 }
 
@@ -51,7 +51,7 @@ fn vs_main(
     let gap   = bar_w * 0.08;                  // 8% gap on each side
     let left  = -1.0 + f32(ii) * bar_w + gap;
     let width = bar_w - 2.0 * gap;
-    let height = norm * 2.0;                   // NDC height: 0..2
+    let height = norm * params.max_height;      // stays below the spectrogram
 
     let q = QUAD[vi];
     let x = left + q.x * width;
